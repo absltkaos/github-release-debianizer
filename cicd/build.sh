@@ -44,7 +44,10 @@ EOF
 
 #Build the package
 if dpkg-buildpackage -us -uc ; then
-    mv ../*.deb ../*.changes ../*.dsc ../*_*.tar.gz ../*.buildinfo builds/
+    mv ../*.deb ../*.changes ../*.dsc ../*_*.tar.gz builds/
+    if ls ../*.buildinfo > /dev/null 2>&1 ; then
+        mv ../*.buildinfo builds/
+    fi
 else
     echo "Package building failed. :-("
     exit 1
