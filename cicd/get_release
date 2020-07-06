@@ -175,14 +175,14 @@ def download_docs(version: str) -> None:
                 dfile.write(data.decode('ascii', 'ignore'))
                 dfile.flush()
         else:
-            LOGGER.warn("Failed to download doc: {}".format(doc))
-            LOGGER.warn(data)
+            LOGGER.warning("Failed to download doc: {}".format(doc))
+            LOGGER.warning(data)
 
 def generate_debian_changelog() -> str:
     """
     Generate a debian package formatted changelog
     """
-    global TAGS
+    global TAGS #pylint: disable=global-statement
     LOGGER.info("Generating changelog from downloaded changelog: ./docs/CHANGELOG.md")
     changelog = []
     if os.path.isfile('./docs/CHANGELOG.md'):
@@ -191,6 +191,7 @@ def generate_debian_changelog() -> str:
         chl_file = open('./docs/CHANGELOG.md', 'r')
         cur_vers = None
         vers_date = None
+        last_vers = None
         for chl_line in chl_file:
             chl_line = chl_line.strip()
             if not chl_line:
@@ -205,6 +206,8 @@ def generate_debian_changelog() -> str:
                 #Strip out parens, and commas
                 chl_split = chl_line.split()
                 cur_vers = chl_split[1]
+                if not last_vers:
+                    last_vers = cur_vers
                 vers_date = ' '.join(chl_split[2:])
                 if '(' and ')' in vers_date:
                     vers_date = vers_date.strip('(').split(')')[0] #We only want the bits in the first set of parens
@@ -217,7 +220,7 @@ def generate_debian_changelog() -> str:
                     #No date found in CHANGELOG, try and grab the date from the tag/releases
                     tag_info = find_tag(TAGS, cur_vers)
                     if not tag_info:
-                        LOGGER.warn("No changelog date found for version: '%s' Using the date from the last version", cur_vers)
+                        LOGGER.warning("No changelog date found for version: '%s' Using the date from the last version", cur_vers)
                         vers_date = last_vers
                     else:
                         vers_date = datetime.datetime.strptime(tag_info['published_at'], '%Y-%m-%dT%H:%M:%SZ').strftime('%a, %d %b %Y %H:%M:%S +0000')
@@ -258,6 +261,8 @@ def find_tag(tags: list, tag: str = 'latest', exclude: str = 'beta') -> str:
     if tag == 'latest':
         #Generate a regular list of tags so they can be sorted
         tags_list = list(tags.keys())
+        #First filter out any that are to be excluded
+        tags_list = list(filter(lambda tag_x: exclude not in tag_x['name'], tags))
         #Human sort them
         tags_list = sorted(tags_list, key=human_keys)
         #Grab the last one
@@ -333,7 +338,7 @@ def download_release(version: str) -> None:
                     tar_file = tarfile.open(asset_file)
                     if GITHUB_ASSET_ARCHIVE_EXTRACT_FILE:
                         try:
-                            cmprs_asset = tar_file.getmember(GITHUB_ASSET_ARCHIVE_EXTRACT_FILE)
+                            cmprs_asset = tar_file.getmember(GITHUB_ASSET_ARCHIVE_EXTRACT_FILE) #pylint: disable=unused-variable
                         except KeyError:
                             LOGGER.error("Cannot find the desired asset: '%s' inside of the tarball: '%s'", GITHUB_ASSET_ARCHIVE_EXTRACT_FILE, asset_file)
                             sys.exit(1)
@@ -435,5 +440,5 @@ with open(RELEASE_ENV_DST, 'w') as REL_FILE:
     REL_FILE.write('CHANGELOG_EMAIL="{}"\n'.format(CHANGELOG_EMAIL))
     REL_FILE.write('CHANGELOG_AUTHOR="{}"\n'.format(CHANGELOG_AUTHOR))
     REL_FILE.write('PACKAGE_NAME="{}"\n'.format(PACKAGE_NAME))
-    REL_FILE.write("PACKAGE_DESCRIPTION='{}'\n".format(PACKAGE_DESCRIPTION.replace("'",'"')))
+    REL_FILE.write("PACKAGE_DESCRIPTION='{}'\n".format(PACKAGE_DESCRIPTION.replace("'", '"')))
     REL_FILE.flush()
