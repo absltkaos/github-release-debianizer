@@ -1,0 +1,4 @@
+export GITHUB_RELEASE_ASSET_TMPLT='yet-another-cloudwatch-exporter_{version}_Linux_x86_64.tar.gz'
+export GITHUB_URL=https://github.com/ivx/yet-another-cloudwatch-exporter
+export GITHUB_ASSET_ARCHIVE_EXTRACT_FILE=yace
+export GITHUB_ASSET_FILE=yace

@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""
+Query github's api for releases, generate a debian style change log per
+release, outputted to stdout. Then download and extract the latest
+configured binary
+"""
+
+import datetime
+import json
+import logging
+import os
+import re
+import shutil
+import ssl
+import sys
+import tarfile
+from urllib import request
+from zipfile import ZipFile
+
+TAGS = None
+TAG = None
+REPO_META = None
+
+RELEASE_ENV_DST = './release.env'
+
+GITHUB_URL = os.environ.get('GITHUB_URL', None)
+if not GITHUB_URL:
+    print("ERROR, you MUST supply a github project url via environment variable 'GITHUB_URL'")
+    sys.exit(1)
+GITHUB_URL_SPLIT = GITHUB_URL.split('/')
+# Override the owner of the github project/repo instead of pulling out of the URL
+GITHUB_OWNER = os.environ.get('GITHUB_OWNER', GITHUB_URL_SPLIT[-2])
+# Override the name of the github project instead of pulling out of the URL
+GITHUB_PROJECT_NAME = os.environ.get('GITHUB_PROJECT_NAME', GITHUB_URL_SPLIT[-1])
+# This is the destination file/resultant thing we care about from the download
+GITHUB_ASSET_FILE = os.environ.get('GITHUB_ASSET_FILE', GITHUB_PROJECT_NAME)
+# File inside of a compressed archive that should be extracted and renamed to GITHUB_ASSET_FILE
+GITHUB_ASSET_ARCHIVE_EXTRACT_FILE = os.environ.get('GITHUB_ASSET_ARCHIVE_EXTRACT_FILE', None)
+# Set the email for changelog entries
+CHANGELOG_EMAIL = os.environ.get('CHANGELOG_EMAIL', 'none@example.com')
+# Set the author name for changelog entries
+CHANGELOG_AUTHOR = os.environ.get('CHANGELOG_AUTHOR', 'Anonymous')
+# Override the default package name in the changelog
+PACKAGE_NAME = os.environ.get('PACKAGE_NAME', GITHUB_PROJECT_NAME)
+# Override the default description for the package from the GITHUB repo URL
+PACKAGE_DESCRIPTION = os.environ.get('PACKAGE_DESCRIPTION', None)
+
+# Examples of templates... currently only 'version' and 'tag' are filled out:
+# - docker-machine-Linux-x86_64
+# - yet-another-cloudwatch-exporter_{version}_Linux_x86_64.tar.gz
+GITHUB_RELEASE_ASSET_TMPLT = os.environ.get('GITHUB_RELEASE_ASSET_TMPLT', GITHUB_PROJECT_NAME)
+
+def http_request(
+        url: str,
+        headers: dict = None,
+        payload: dict = None,
+        insecure: bool = False,
+        logger=None) -> tuple:
+    """
+    Make an HTTP request
+
+    Args:
+        url:
+            Url to send the request to
+        headers: dict
+            Optional dictionary of headers to pass
+        payload: dict
+            Optional payload of dict values to send
+        insecure: bool
+            Optional flag to indicate whether certificate validation to the
+            http server should happen.
+        logger:
+            Optional logger object
+    Returns Tuple
+        Element 1: Bool: Indicating success
+        Element 2: Str: Response from the request to the HTTP server
+    """
+    ctx = None
+    cafile = None
+    data = None
+    if not headers:
+        headers = dict()
+    if logger:
+        log = logger
+    else:
+        log = LOGGER
+    if payload:
+        headers['Content-Type'] = 'application/json'
+        data = json.dumps(payload).encode()
+    if insecure:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    req = request.Request(
+        url=url,
+        data=data,
+        headers=headers
+    )
+    try:
+        rsp = request.urlopen(req, timeout=5, cafile=cafile, context=ctx)
+    except Exception:
+        exc_type, exc_value = sys.exc_info()[:2]
+        exc_str = "Failed sending request to {url}: {exc_type}: {exc_val}".format(
+            url=url,
+            exc_type=exc_type.__name__,
+            exc_val=exc_value
+        )
+        log.error(exc_str)
+        return (False, exc_value)
+    data = rsp.read()
+    if rsp.code >= 200 and rsp.code <= 299:
+        return (True, data)
+    return (False, data)
+
+def github_api_request(path: str, api_base: str = 'https://api.github.com') -> tuple:
+    """
+    Make an HTTP request to the github_api
+
+    Args:
+        path:
+            The path (URI) on github's API where the request should be sent
+        api_base:
+            The base part of the URL where github's api can be found
+    Returns Tuple
+        Element 1: Bool: Indicating success
+        Element 2: Str: Response from the request to the api server
+    """
+    if path[0] != '/':
+        path = '/{}'.format(path)
+    status, data = http_request('{api_base}{path}'.format(path=path, api_base=api_base))
+    return (status, data.decode())
+
+def get_tags() -> list:
+    """
+    Query github api for all tags (releases)
+    """
+    LOGGER.info("Getting list of tags (releases)")
+    releases = {}
+    api_res = github_api_request('/repos/{github_owner}/{github_project_name}/releases'.format(github_owner=GITHUB_OWNER, github_project_name=GITHUB_PROJECT_NAME))
+    if not api_res[0]:
+        LOGGER.error("Could not query github for list of tags/releases: {}".format(api_res[1]))
+        sys.exit(1)
+    else:
+        releases_raw = json.loads(api_res[1])
+        for release in releases_raw:
+            releases[release['tag_name']] = release
+    return releases
+
+def get_repo_metadata() -> dict:
+    """
+    Query github api for the repo's metadata information
+    """
+    LOGGER.info("Getting repo metadata")
+    api_res = github_api_request('/repos/{github_owner}/{github_project_name}'.format(github_owner=GITHUB_OWNER, github_project_name=GITHUB_PROJECT_NAME))
+    if not api_res[0]:
+        LOGGER.error("Could not query github for metadata: {}".format(api_res[1]))
+        sys.exit(1)
+    return json.loads(api_res[1])
+
+def download_docs(version: str) -> None:
+    """
+    Take a version string and grab the doc files from the github repo
+    """
+    docs = ('CHANGELOG.md', 'README.md', 'LICENSE')
+    mkdirs('./docs')
+    for doc in docs:
+        url = 'https://raw.githubusercontent.com/{github_owner}/{github_project_name}/{version}/{doc}'.format(github_owner=GITHUB_OWNER, github_project_name=GITHUB_PROJECT_NAME, version=version, doc=doc)
+        LOGGER.info("Generated download link for doc: {doc} for version: {version}: {url}".format(doc=doc, version=version, url=url))
+        LOGGER.info("Downloading....")
+        status, data = http_request(url)
+        if status:
+            LOGGER.info("Downloading done. Status={status} size={size}".format(status=status, size=len(data)))
+            with open('./docs/{}'.format(doc), 'w') as dfile:
+                LOGGER.info("Saving file: {}".format(dfile.name))
+                dfile.write(data.decode('ascii', 'ignore'))
+                dfile.flush()
+        else:
+            LOGGER.warn("Failed to download doc: {}".format(doc))
+            LOGGER.warn(data)
+
+def generate_debian_changelog() -> str:
+    """
+    Generate a debian package formatted changelog
+    """
+    global TAGS
+    LOGGER.info("Generating changelog from downloaded changelog: ./docs/CHANGELOG.md")
+    changelog = []
+    if os.path.isfile('./docs/CHANGELOG.md'):
+        #Create Changelog from docs/CHANGELOG
+        LOGGER.info("Generating changelog from docs/CHANGELOG")
+        chl_file = open('./docs/CHANGELOG.md', 'r')
+        cur_vers = None
+        vers_date = None
+        for chl_line in chl_file:
+            chl_line = chl_line.strip()
+            if not chl_line:
+                continue
+            if chl_line[0:2] == '# ' and chl_line[2].isdigit():
+                #Working on a new version, everything after this line is part of
+                #this new version
+                #This must be end of the changes for this version, so add changelog
+                #footer for the version
+                if cur_vers:
+                    changelog.append('\n -- {author} <{email}>  {timestamp}\n'.format(author=CHANGELOG_AUTHOR, email=CHANGELOG_EMAIL, timestamp=vers_date))
+                #Strip out parens, and commas
+                chl_split = chl_line.split()
+                cur_vers = chl_split[1]
+                vers_date = ' '.join(chl_split[2:])
+                if '(' and ')' in vers_date:
+                    vers_date = vers_date.strip('(').split(')')[0] #We only want the bits in the first set of parens
+                    vers_date = vers_date.replace('th,', ',').replace('st,', ',').replace('rd,', ',').replace('nd,', ',')
+                    try:
+                        vers_date = datetime.datetime.strptime(vers_date, '%Y-%m-%d').strftime('%a, %d %b %Y %H:%M:%S +0000')
+                    except ValueError:
+                        vers_date = datetime.datetime.strptime(vers_date, '%Y-%m').strftime('%a, %d %b %Y %H:%M:%S +0000') #one of the dates in the changelog doesn't have the day.
+                else:
+                    #No date found in CHANGELOG, try and grab the date from the tag/releases
+                    tag_info = find_tag(TAGS, cur_vers)
+                    if not tag_info:
+                        LOGGER.warn("No changelog date found for version: '%s' Using the date from the last version", cur_vers)
+                        vers_date = last_vers
+                    else:
+                        vers_date = datetime.datetime.strptime(tag_info['published_at'], '%Y-%m-%dT%H:%M:%SZ').strftime('%a, %d %b %Y %H:%M:%S +0000')
+                changelog.append('{package_name} ({version}) unstable; urgency=low\n'.format(package_name=PACKAGE_NAME, version=cur_vers.lstrip('v')))
+                last_vers = cur_vers
+                continue
+            if cur_vers:
+                changelog.append('  {}'.format(chl_line))
+        #All done, append last changlog footer
+        changelog.append('\n -- {author} <{email}>  {timestamp}\n'.format(author=CHANGELOG_AUTHOR, email=CHANGELOG_EMAIL, timestamp=vers_date))
+    else:
+        #Create the changelog from the releases information
+        LOGGER.info("No CHANGELOG.md found, generating from github release information")
+        tags_list = list(TAGS.keys())
+        #Human sort them
+        tags_list = sorted(tags_list, key=human_keys)
+        tags_list.reverse()
+        for tag in tags_list:
+            tag_info = TAGS[tag]
+            cur_vers = tag
+            vers_date = datetime.datetime.strptime(tag_info['published_at'], '%Y-%m-%dT%H:%M:%SZ').strftime('%a, %d %b %Y %H:%M:%S +0000')
+            changelog.append('{package_name} ({version}) unstable; urgency=low\n'.format(package_name=PACKAGE_NAME, version=cur_vers.lstrip('v')))
+            for chl_line in tag_info['body'].splitlines():
+                changelog.append('  {}'.format(chl_line))
+            changelog.append('\n -- {author} <{email}>  {timestamp}\n'.format(author=CHANGELOG_AUTHOR, email=CHANGELOG_EMAIL, timestamp=vers_date))
+    return '\n'.join(changelog)
+
+def find_tag(tags: list, tag: str = 'latest', exclude: str = 'beta') -> str:
+    """
+    Go through the github api tags response and find the tag passed.
+
+    Returns the tag found
+    """
+    tags_list = []
+    val = None
+    if not tag:
+        tag = 'latest'
+    if tag == 'latest':
+        #Generate a regular list of tags so they can be sorted
+        tags_list = list(tags.keys())
+        #Human sort them
+        tags_list = sorted(tags_list, key=human_keys)
+        #Grab the last one
+        val = tags[tags_list[-1]]
+    else:
+        try:
+            val = tags[tag]
+        except KeyError:
+            try:
+                val = tags['v{}'.format(tag)]
+            except KeyError:
+                val = None
+    return val
+
+def download_release(version: str) -> None:
+    """
+    Grab the latest release, download it, and extract it
+    """
+    if not version:
+        return
+    asset_file = GITHUB_RELEASE_ASSET_TMPLT.format(tag=version, version=version.lstrip('v'))
+    asset_file_type = 'bin'
+    url = 'https://github.com/{github_owner}/{github_project_name}/releases/download/{version}/{asset_file}'.format(github_owner=GITHUB_OWNER, github_project_name=GITHUB_PROJECT_NAME, version=version, asset_file=asset_file)
+    LOGGER.info("Generated Linux-x86_64 download link for version: {version}: {url}".format(version=version, url=url))
+    LOGGER.info("Downloading....")
+    status, data = http_request(url)
+    if status:
+        asset_file_splitext = os.path.splitext(asset_file)
+        if asset_file_splitext[1] == '.zip':
+            asset_file_type = 'zip'
+        elif asset_file_splitext[1] in ('.gz', '.bz'):
+            if os.path.splitext(asset_file_splitext[0])[1] == '.tar':
+                asset_file_type = 'tarball'
+        elif asset_file_splitext[1] in ('.tgz', 'tbz'):
+            asset_file_type = 'tarball'
+        if asset_file_type == 'bin':
+            asset_file = GITHUB_ASSET_FILE
+        LOGGER.info("Downloading done. Status={status} size={size}".format(status=status, size=len(data)))
+        with open(asset_file, 'wb') as dfile:
+            LOGGER.info("Saving asset file: {}".format(dfile.name))
+            dfile.write(data)
+            dfile.flush()
+        if os.path.isfile('./{}'.format(asset_file)):
+            LOGGER.info("Found asset file type: %s", asset_file_type)
+            if asset_file_type == 'bin':
+                pass
+            elif asset_file_type == 'zip':
+                LOGGER.info("Unzipping...")
+                try:
+                    zip_file = ZipFile(asset_file)
+                    files = zip_file.namelist()
+                    for fil in files:
+                        LOGGER.info("Found file: '{}' in zip".format(fil))
+                        if fil.lower() == GITHUB_ASSET_ARCHIVE_EXTRACT_FILE:
+                            LOGGER.info("Extracting '%s'", GITHUB_ASSET_ARCHIVE_EXTRACT_FILE)
+                            zip_file.extract(fil)
+                            if GITHUB_ASSET_ARCHIVE_EXTRACT_FILE != GITHUB_ASSET_FILE:
+                                LOGGER.info("Renaming: '%s' -> '%s'", GITHUB_ASSET_ARCHIVE_EXTRACT_FILE, GITHUB_ASSET_FILE)
+                                shutil.move(GITHUB_ASSET_ARCHIVE_EXTRACT_FILE, GITHUB_ASSET_FILE)
+                            break
+                except Exception: #pylint: disable=broad-except
+                    exc_type, exc_value = sys.exc_info()[:2]
+                    exc_str = "Failed extracting compressed zip asset: {asset_file}: {exc_type}: {exc_val}".format(
+                        asset_file=asset_file,
+                        exc_type=exc_type.__name__,
+                        exc_val=exc_value
+                    )
+                    LOGGER.error(exc_str)
+                    sys.exit(1)
+            elif asset_file_type == 'tarball':
+                LOGGER.info("Extracting asset(s) from tarball")
+                try:
+                    tar_file = tarfile.open(asset_file)
+                    if GITHUB_ASSET_ARCHIVE_EXTRACT_FILE:
+                        try:
+                            cmprs_asset = tar_file.getmember(GITHUB_ASSET_ARCHIVE_EXTRACT_FILE)
+                        except KeyError:
+                            LOGGER.error("Cannot find the desired asset: '%s' inside of the tarball: '%s'", GITHUB_ASSET_ARCHIVE_EXTRACT_FILE, asset_file)
+                            sys.exit(1)
+                        tar_file.extract(GITHUB_ASSET_ARCHIVE_EXTRACT_FILE, path='./')
+                        if GITHUB_ASSET_ARCHIVE_EXTRACT_FILE != GITHUB_ASSET_FILE:
+                            LOGGER.info("Renaming: '%s' -> '%s'", GITHUB_ASSET_ARCHIVE_EXTRACT_FILE, GITHUB_ASSET_FILE)
+                            shutil.move(GITHUB_ASSET_ARCHIVE_EXTRACT_FILE, GITHUB_ASSET_FILE)
+                    else:
+                        tar_file.extractall(path='./')
+                except Exception: #pylint: disable=broad-except
+                    exc_type, exc_value = sys.exc_info()[:2]
+                    exc_str = "Failed extracting compressed tarball asset: {asset_file}: {exc_type}: {exc_val}".format(
+                        asset_file=asset_file,
+                        exc_type=exc_type.__name__,
+                        exc_val=exc_value
+                    )
+                    LOGGER.error(exc_str)
+                    sys.exit(1)
+            else:
+                LOGGER.error("Unknown asset file type: %s", asset_file_type)
+                sys.exit(1)
+            os.chmod(GITHUB_ASSET_FILE, 0o755)
+    else:
+        LOGGER.error("Failed downloading file")
+        LOGGER.error(data)
+        sys.exit(1)
+
+def human_keys(astr):
+    """
+    Sorts keys based on human order.. IE 1 is less than 10 etc..
+
+    alist.sort(key=human_keys) sorts in human order
+    """
+    keys = []
+    for elt in re.split(r'(\d+)', astr):
+        elt = elt.swapcase()
+        try:
+            elt = int(elt)
+        except ValueError:
+            pass
+        keys.append(elt)
+    return keys
+def mkdirs(path: str, mode: int = 0o755) -> bool:
+    """
+    This is like mkdir -p
+
+    Args:
+        path: str
+            Path to the ending directory desired to create
+        mode: int
+            Optional mode to set when creating the directories
+
+    Returns Bool of success or failure
+    """
+    if os.path.isdir(path):
+        return True
+    try:
+        os.makedirs(path, mode=mode)
+        return True
+    except FileExistsError as e:
+        if os.access(path, os.W_OK):
+            return True
+        LOGGER.warning("Path {}: exists but is unwritable".format(path))
+        return False
+    except OSError as e:
+        if e.errno == 17: #This is fileexists
+            return True
+        LOGGER.error("{}".format(os.strerror))
+        return False
+
+#-- Main --#
+VERSION = None
+if len(sys.argv) > 1:
+    VERSION = sys.argv[1]
+
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+LOGGER = logging.getLogger("Main")
+
+REPO_META = get_repo_metadata()
+if not PACKAGE_DESCRIPTION:
+    PACKAGE_DESCRIPTION = REPO_META['description']
+TAGS = get_tags()
+TAG = find_tag(TAGS, VERSION)
+if not TAG:
+    LOGGER.error("Could not find version: {}".format(VERSION))
+    sys.exit(1)
+download_release(TAG['tag_name'])
+download_docs(TAG['tag_name'])
+print(generate_debian_changelog())
+LOGGER.info("Generating release environment file at: '%s'", RELEASE_ENV_DST)
+with open(RELEASE_ENV_DST, 'w') as REL_FILE:
+    REL_FILE.write('GITHUB_URL="{}"\n'.format(GITHUB_URL))
+    REL_FILE.write('GITHUB_OWNER="{}"\n'.format(GITHUB_OWNER))
+    REL_FILE.write('GITHUB_PROJECT_NAME="{}"\n'.format(GITHUB_PROJECT_NAME))
+    REL_FILE.write('GITHUB_ASSET_FILE="{}"\n'.format(GITHUB_ASSET_FILE))
+    REL_FILE.write('CHANGELOG_EMAIL="{}"\n'.format(CHANGELOG_EMAIL))
+    REL_FILE.write('CHANGELOG_AUTHOR="{}"\n'.format(CHANGELOG_AUTHOR))
+    REL_FILE.write('PACKAGE_NAME="{}"\n'.format(PACKAGE_NAME))
+    REL_FILE.write("PACKAGE_DESCRIPTION='{}'\n".format(PACKAGE_DESCRIPTION.replace("'",'"')))
+    REL_FILE.flush()

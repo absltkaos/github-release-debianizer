@@ -1,0 +1,27 @@
+#!/usr/bin/make -f
+
+include release.env
+export
+# Add here any variable or target overrides you need.
+%:
+	dh $@ --with systemd
+
+override_dh_auto_clean:
+	dh_clean
+	rm -rf build/
+
+override_dh_auto_install:
+	mkdir build
+	if [ -f ${GITHUB_ASSET_FILE} ] ; then \
+	    cp ${GITHUB_ASSET_FILE} build/; \
+	else \
+		echo "ERROR: '${GITHUB_ASSET_FILE}' binary is missing! Try running ./get_release?"; \
+		exit 1; \
+	fi
+	if [ -d './docs' ] ; then \
+		cp -r docs build/; \
+	else \
+		echo "WARNING: 'docs' are missing! Try running ./get_release again?"; \
+	fi
+
+.PHONY: build

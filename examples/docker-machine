@@ -1,0 +1,5 @@
+export GITHUB_RELEASE_ASSET_TMPLT='docker-machine-Linux-x86_64'
+export GITHUB_URL=https://github.com/docker/machine
+export GITHUB_ASSET_ARCHIVE_EXTRACT_FILE=docker-machine
+export GITHUB_ASSET_FILE=docker-machine
+export PACKAGE_NAME=docker-machine
