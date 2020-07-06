@@ -262,7 +262,7 @@ def find_tag(tags: list, tag: str = 'latest', exclude: str = 'beta') -> str:
         #Generate a regular list of tags so they can be sorted
         tags_list = list(tags.keys())
         #First filter out any that are to be excluded
-        tags_list = list(filter(lambda tag_x: exclude not in tag_x['name'], tags))
+        tags_list = list(filter(lambda tag_x: exclude not in tag_x, tags_list))
         #Human sort them
         tags_list = sorted(tags_list, key=human_keys)
         #Grab the last one
