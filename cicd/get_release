@@ -44,6 +44,8 @@ CHANGELOG_AUTHOR = os.environ.get('CHANGELOG_AUTHOR', 'Anonymous')
 PACKAGE_NAME = os.environ.get('PACKAGE_NAME', GITHUB_PROJECT_NAME)
 # Override the default description for the package from the GITHUB repo URL
 PACKAGE_DESCRIPTION = os.environ.get('PACKAGE_DESCRIPTION', None)
+# Append a patch version to the version of the package created. Useful if changes are made to the debian package but not the binary
+PACKAGE_PATCH_VER = os.environ.get('PACKAGE_PATCH_VER', None)
 
 # Examples of templates... currently only 'version' and 'tag' are filled out:
 # - docker-machine-Linux-x86_64
@@ -224,7 +226,7 @@ def generate_debian_changelog() -> str:
                         vers_date = last_vers
                     else:
                         vers_date = datetime.datetime.strptime(tag_info['published_at'], '%Y-%m-%dT%H:%M:%SZ').strftime('%a, %d %b %Y %H:%M:%S +0000')
-                changelog.append('{package_name} ({version}) unstable; urgency=low\n'.format(package_name=PACKAGE_NAME, version=cur_vers.lstrip('v')))
+                changelog.append('{package_name} ({version}{patch_version}) unstable; urgency=low\n'.format(package_name=PACKAGE_NAME, version=cur_vers.lstrip('v'), patch_version=PACKAGE_PATCH_VER))
                 last_vers = cur_vers
                 continue
             if cur_vers:
@@ -242,7 +244,7 @@ def generate_debian_changelog() -> str:
             tag_info = TAGS[tag]
             cur_vers = tag
             vers_date = datetime.datetime.strptime(tag_info['published_at'], '%Y-%m-%dT%H:%M:%SZ').strftime('%a, %d %b %Y %H:%M:%S +0000')
-            changelog.append('{package_name} ({version}) unstable; urgency=low\n'.format(package_name=PACKAGE_NAME, version=cur_vers.lstrip('v')))
+            changelog.append('{package_name} ({version}{patch_version}) unstable; urgency=low\n'.format(package_name=PACKAGE_NAME, version=cur_vers.lstrip('v'), patch_version=PACKAGE_PATCH_VER))
             for chl_line in tag_info['body'].splitlines():
                 changelog.append('  {}'.format(chl_line))
             changelog.append('\n -- {author} <{email}>  {timestamp}\n'.format(author=CHANGELOG_AUTHOR, email=CHANGELOG_EMAIL, timestamp=vers_date))
@@ -423,6 +425,8 @@ LOGGER = logging.getLogger("Main")
 REPO_META = get_repo_metadata()
 if not PACKAGE_DESCRIPTION:
     PACKAGE_DESCRIPTION = REPO_META['description']
+if PACKAGE_PATCH_VER:
+    PACKAGE_PATCH_VER = '-{}'.format(PACKAGE_PATCH_VER)
 TAGS = get_tags()
 TAG = find_tag(TAGS, VERSION)
 if not TAG:
